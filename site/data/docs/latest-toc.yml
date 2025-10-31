@@ -1,0 +1,29 @@
+---
+toc:
+  - title: About Sealed Secrets
+    subfolderitems:
+      - page: What is Sealed Secrets
+        url: /project/readme
+      - page: Sealed Secrets helm chart
+        url: /project/chart-readme
+
+  - title: Tutorials
+    subfolderitems:
+      - url: /tutorials/getting-started
+        page: Get Started with Sealed Secrets
+      - url: /tutorials/install-sealed-secrets
+        page: Sealed Secrets controller installation
+  - title: How-to guides
+    subfolderitems:
+      - url: /howto/validate-sealed-secrets
+        page: Validate an existing Sealed Secret
+
+  - title: Background
+    subfolderitems:
+      - url: /background/cryptography
+        page: Cryptography details
+
+  - title: Reference
+    subfolderitems:
+      - url: /reference/faq
+        page: FAQ

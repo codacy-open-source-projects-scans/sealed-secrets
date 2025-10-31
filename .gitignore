@@ -1,0 +1,46 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
+.glide/
+
+# Project-local vscode config
+.vscode/
+
+/controller
+/kubeseal
+/kubeseal-arm
+/kubeseal-arm64
+
+/controller.image
+/controller.image.*
+/kubeseal.image
+/kubeseal.image.*
+/pushed.controller.image.*
+/pushed.kubeseal.image.*
+/controller-manifest-*
+/push-controller-image
+/*-static
+/*-static-*
+/controller.yaml
+/controller-norbac.yaml
+/controller-podmonitor.yaml
+/docker/controller
+*.iml
+.idea
+
+# GoReleaser output dir
+dist/
+
+# Vendor folder
+vendor/
+report.xml
