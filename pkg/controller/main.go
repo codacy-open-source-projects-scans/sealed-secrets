@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"k8s.io/apimachinery/pkg/watch"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,6 +58,8 @@ type Flags struct {
 	PrivateKeyLabels      string
 	MaxRetries            int
 	WatchForSecrets       bool
+	KubeClientQPS         float32
+	KubeClientBurst       int
 }
 
 func initKeyPrefix(keyPrefix string) (string, error) {
@@ -124,37 +124,6 @@ func getKeyOrderPriority(keyOrderPriority string, cert *x509.Certificate, secret
 	return cert.NotBefore
 }
 
-func watchKeyRegistry(ctx context.Context, client kubernetes.Interface, keyRegistry *KeyRegistry, namespace, keyOrderPriority string) error {
-	watcher, err := client.CoreV1().Secrets(namespace).Watch(ctx, metav1.ListOptions{
-		LabelSelector: keySelector.String(),
-	})
-	if err != nil {
-		return err
-	}
-
-	for event := range watcher.ResultChan() {
-		secret := event.Object.(*v1.Secret)
-		if secret == nil {
-			continue
-		}
-
-		switch event.Type {
-		case watch.Added:
-			err = registryNewKeyWithSecret(secret, keyRegistry, keyOrderPriority)
-			if err != nil {
-				return err
-			}
-		case watch.Modified:
-		case watch.Deleted:
-		case watch.Error:
-		case watch.Bookmark:
-		default:
-			slog.Info("Unexpected watch event", "type", event.Type)
-		}
-	}
-	return nil
-}
-
 func myNamespace() string {
 	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
 		return ns
@@ -209,6 +178,9 @@ func Main(f *Flags, version string) error {
 	if err != nil {
 		return err
 	}
+
+	config.QPS = f.KubeClientQPS
+	config.Burst = f.KubeClientBurst
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -274,13 +246,6 @@ func Main(f *Flags, version string) error {
 
 	go controller.Run(stop)
 
-	if f.WatchForSecrets {
-		go func() {
-			err := watchKeyRegistry(ctx, clientset, keyRegistry, myNs, f.KeyOrderPriority)
-			slog.Error("Watch fo secrets", "err", err)
-		}()
-	}
-
 	if f.AdditionalNamespaces != "" {
 		addNS := removeDuplicates(strings.Split(f.AdditionalNamespaces, ","))
 
@@ -331,16 +296,26 @@ func Main(f *Flags, version string) error {
 	return nil
 }
 
-func prepareController(clientset kubernetes.Interface, namespace string, tweakopts func(*metav1.ListOptions), f *Flags, ssclientset versioned.Interface, keyRegistry *KeyRegistry) (*Controller, error) {
+func prepareController(
+	clientset kubernetes.Interface,
+	namespace string,
+	tweakopts func(*metav1.ListOptions),
+	f *Flags,
+	ssclientset versioned.Interface,
+	keyRegistry *KeyRegistry,
+) (*Controller, error) {
+	kinformer := initSecretInformerFactory(clientset, namespace, func(options *metav1.ListOptions) {
+		options.LabelSelector = keySelector.String()
+	}, f.WatchForSecrets)
 	sinformer := initSecretInformerFactory(clientset, namespace, tweakopts, f.SkipRecreate)
 	ssinformer := ssinformers.NewFilteredSharedInformerFactory(ssclientset, 0, namespace, tweakopts)
-	controller, err := NewController(clientset, ssclientset, ssinformer, sinformer, keyRegistry, f.MaxRetries)
+	controller, err := NewController(clientset, ssclientset, ssinformer, sinformer, kinformer, keyRegistry, f.MaxRetries, f.KeyOrderPriority)
 	return controller, err
 }
 
-func initSecretInformerFactory(clientset kubernetes.Interface, ns string, tweakopts func(*metav1.ListOptions), skipRecreate bool) informers.SharedInformerFactory {
-	if skipRecreate {
+func initSecretInformerFactory(clientset kubernetes.Interface, ns string, tweakopts func(*metav1.ListOptions), enabled bool) informers.SharedInformerFactory {
+	if enabled {
 		return nil
 	}
-	return informers.NewFilteredSharedInformerFactory(clientset, 0, ns, tweakopts)
+	return informers.NewSharedInformerFactoryWithOptions(clientset, 0, informers.WithNamespace(ns), informers.WithTweakListOptions(tweakopts))
 }
