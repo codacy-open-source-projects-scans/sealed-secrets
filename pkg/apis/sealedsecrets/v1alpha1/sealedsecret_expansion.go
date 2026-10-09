@@ -17,7 +17,7 @@ import (
 	"github.com/Masterminds/sprig/v3"
 	"github.com/mkmik/multierror"
 
-	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
+	"github.com/bitnami/sealed-secrets/pkg/crypto"
 )
 
 const (
@@ -231,7 +231,7 @@ func NewSealedSecret(codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKe
 	// which put a copy of the object version at application time in an annotation in order to support
 	// strategic merge patch in subsequent updates. We need to strip those annotations or else we would
 	// be leaking secrets in clear in a way that might be non obvious to users.
-	// See https://github.com/bitnami-labs/sealed-secrets/issues/227
+	// See https://github.com/bitnami/sealed-secrets/issues/227
 	StripLastAppliedAnnotations(s.Spec.Template.ObjectMeta.Annotations)
 
 	// Cleanup ownerReference (See #243)
@@ -262,8 +262,47 @@ func NewSealedSecret(codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKe
 	return s, nil
 }
 
-// Unseal decrypts and returns the embedded v1.Secret.
+// ValidateEncryptedData checks decryptability without rendering spec.template.data.
+func (s *SealedSecret) ValidateEncryptedData(privKeys map[string]*rsa.PrivateKey) error {
+	label := labelFor(s.GetObjectMeta())
+
+	if s.Spec.Data == nil {
+		var errs []error
+		for key, value := range s.Spec.EncryptedData {
+			valueBytes, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				errs = append(errs, multierror.Tag(key, err))
+				continue
+			}
+			if _, err := crypto.HybridDecrypt(rand.Reader, privKeys, valueBytes, label); err != nil {
+				errs = append(errs, multierror.Tag(key, err))
+			}
+		}
+		if errs != nil {
+			return multierror.Format(errors.Join(multierror.Uniq(errs)...), multierror.InlineFormatter)
+		}
+		return nil
+	} else if AcceptDeprecatedV1Data { // Support decrypting old secrets for backward compatibility
+		if len(s.Spec.EncryptedData) > 0 {
+			return fmt.Errorf("cannot use the field 'encryptedData' and the deprecated field 'data' at the same time")
+		}
+		_, err := crypto.HybridDecrypt(rand.Reader, privKeys, s.Spec.Data, label)
+		return err
+	}
+	return fmt.Errorf("using deprecated 'data' field, use 'encryptedData' or flip the feature flag")
+}
+
+// Unseal decrypts and returns the embedded v1.Secret, rendering spec.template.data as a Go template.
 func (s *SealedSecret) Unseal(codecs runtimeserializer.CodecFactory, privKeys map[string]*rsa.PrivateKey) (*v1.Secret, error) {
+	return s.unseal(codecs, privKeys, true)
+}
+
+// UnsealWithoutTemplate is like Unseal but skips rendering spec.template.data, since it's not authenticated and could be used as a decryption oracle.
+func (s *SealedSecret) UnsealWithoutTemplate(codecs runtimeserializer.CodecFactory, privKeys map[string]*rsa.PrivateKey) (*v1.Secret, error) {
+	return s.unseal(codecs, privKeys, false)
+}
+
+func (s *SealedSecret) unseal(codecs runtimeserializer.CodecFactory, privKeys map[string]*rsa.PrivateKey, renderTemplate bool) (*v1.Secret, error) {
 	boolTrue := true
 	smeta := s.GetObjectMeta()
 
@@ -298,19 +337,44 @@ func (s *SealedSecret) Unseal(codecs runtimeserializer.CodecFactory, privKeys ma
 			data[key] = string(plaintext)
 		}
 
-		for key, value := range s.Spec.Template.Data {
-			var plaintext bytes.Buffer
+		if renderTemplate {
+			// Expose raw plaintext values from spec.template.data in the
+			// template rendering context, so that templates defined in
+			// spec.template.data can reference sibling plaintext keys as
+			// {{ .key }} variables (e.g. {{ .username }} alongside an
+			// encrypted password). Encrypted values take precedence on key
+			// collision so adding a plaintext key can never silently shadow
+			// a real secret value.
+			// See https://github.com/bitnami-labs/sealed-secrets/issues/1607
+			for key, value := range s.Spec.Template.Data {
+				if _, exists := data[key]; !exists && value != nil {
+					data[key] = *value
+				}
+			}
 
-			template, err := template.New(key).Funcs(sprigFuncMap).Parse(value)
-			if err != nil {
-				errs = append(errs, multierror.Tag(key, err))
-				continue
+			for key, value := range s.Spec.Template.Data {
+				var plaintext bytes.Buffer
+
+				if value == nil {
+					delete(secret.Data, key)
+					continue
+				}
+				template, err := template.New(key).Funcs(sprigFuncMap).Parse(*value)
+				if err != nil {
+					errs = append(errs, multierror.Tag(key, err))
+					continue
+				}
+				err = template.Execute(&plaintext, data)
+				if err != nil {
+					errs = append(errs, multierror.Tag(key, err))
+				}
+				// Do not overwrite a key that was already populated from
+				// encryptedData; encrypted values take precedence in the
+				// output Secret as well as in the template rendering context.
+				if _, fromEncrypted := s.Spec.EncryptedData[key]; !fromEncrypted {
+					secret.Data[key] = plaintext.Bytes()
+				}
 			}
-			err = template.Execute(&plaintext, data)
-			if err != nil {
-				errs = append(errs, multierror.Tag(key, err))
-			}
-			secret.Data[key] = plaintext.Bytes()
 		}
 
 		if errs != nil {

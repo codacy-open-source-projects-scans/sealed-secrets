@@ -29,17 +29,39 @@ type certProvider func() ([]*x509.Certificate, error)
 type secretChecker func([]byte) (bool, error)
 type secretRotator func([]byte) ([]byte, error)
 
+// readyFunc reports whether controller bootstrap finished (informers for the
+// home namespace and any --additional-namespaces have been started).
+// A nil readyFunc treats the process as always ready.
+type readyFunc func() bool
+
 // httpserver starts an HTTP that exposes core functionality like serving the public key
 // or secret rotation and validation. This endpoint is designed to be accessible by
 // all users of a given cluster. It must not leak any secret material.
 // The server is started in the background and a handle to it returned so it can be shut down.
-func httpserver(cp certProvider, sc secretChecker, sr secretRotator, burst int, rate int) *http.Server {
+//
+// /healthz is a liveness probe: it always succeeds once the listener is up so the
+// process is not killed while additional namespace informers are still starting.
+// /readyz is a readiness probe: it returns 503 until ready reports true.
+func httpserver(cp certProvider, sc secretChecker, sr secretRotator, burst int, rate int, ready readyFunc) *http.Server {
 	httpRateLimiter := rateLimiter(burst, rate)
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, err := io.WriteString(w, "ok\n")
+		if err != nil {
+			log.Fatal(err)
+		}
+	})
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if ready != nil && !ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "not ready\n")
+			return
+		}
 		_, err := io.WriteString(w, "ok\n")
 		if err != nil {
 			log.Fatal(err)
@@ -69,7 +91,7 @@ func httpserver(cp certProvider, sc secretChecker, sr secretRotator, burst int, 
 	}))))
 
 	// TODO(mkm): rename to re-encrypt
-	mux.Handle("/v1/rotate", Instrument("/v1/rotate", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/v1/rotate", Instrument("/v1/rotate", httpRateLimiter.RateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		content, err := io.ReadAll(r.Body)
 		if err != nil {
 			slog.Error("Error handling /v1/rotate request", "error", err)
@@ -87,7 +109,7 @@ func httpserver(cp certProvider, sc secretChecker, sr secretRotator, burst int, 
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(newSecret)
-	})))
+	}))))
 
 	mux.Handle("/v1/cert.pem", Instrument("/v1/cert.pem", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		certs, err := cp()

@@ -4,24 +4,33 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"encoding/json"
 
-	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
+	ssv1alpha1 "github.com/bitnami/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
+	ssfake "github.com/bitnami/sealed-secrets/pkg/client/clientset/versioned/fake"
+	"github.com/bitnami/sealed-secrets/pkg/crypto"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
-
-	ssfake "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/fake"
+	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
+
+func someStr(s string) *string {
+	return &s
+}
 
 func TestIsAnnotatedToBePatched(t *testing.T) {
 	tests := []struct {
@@ -396,5 +405,298 @@ func TestRotateKeepScope(t *testing.T) {
 
 	if ssv1alpha1.SecretScope(s) != ssv1alpha1.SecretScope(ssecret) {
 		t.Fatalf("Scope from the original and the rotate sealed secret do not match")
+	}
+}
+
+// TestAttemptUnsealIgnoresTemplate is a regression test for the /v1/verify decryption oracle.
+func TestAttemptUnsealIgnoresTemplate(t *testing.T) {
+	ns := "some-namespace"
+	keyNs := "some-key-namespace"
+	var tweakopts func(*metav1.ListOptions)
+	clientset := fake.NewClientset()
+	ssc := ssfake.NewSimpleClientset()
+	keyRegistry := testKeyRegister(t, context.Background(), clientset, ns)
+
+	validFor := time.Hour
+	cn := "my-cn"
+	_, err := keyRegistry.generateKey(context.Background(), validFor, cn, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	controller, err := prepareController(clientset, ns, keyNs, tweakopts, &Flags{SkipRecreate: false}, ssc, keyRegistry)
+	if err != nil {
+		t.Fatalf("err %v want %v", err, nil)
+	}
+
+	secret := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ss",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("hunter2"),
+		},
+	}
+
+	cert, err := controller.keyRegistry.getCert()
+	if err != nil {
+		t.Fatalf("error getting certificate: %v", err)
+	}
+
+	ssecret, err := ssv1alpha1.NewSealedSecret(scheme.Codecs, cert.PublicKey.(*rsa.PublicKey), secret)
+	if err != nil {
+		t.Fatalf("error creating sealed secrets: %v", err)
+	}
+
+	// Attacker-controlled, always-failing template paired with the victim's real data.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ fail "attacker-controlled failure" }}`),
+	}
+
+	enc, err := prettyEncoder(scheme.Codecs, runtime.ContentTypeJSON, ssv1alpha1.SchemeGroupVersion)
+	if err != nil {
+		t.Fatalf("unexpected pretty encoding: %v", err)
+	}
+	data, err := runtime.Encode(enc, ssecret)
+	if err != nil {
+		t.Fatalf("unexpected encoding the sealed secret: %v", err)
+	}
+
+	valid, err := controller.AttemptUnseal(data)
+	if err != nil {
+		t.Fatalf("AttemptUnseal returned error: %v", err)
+	}
+	if !valid {
+		t.Errorf("AttemptUnseal reported a decryptable secret as invalid because of an unrelated template failure")
+	}
+}
+
+// TestRotateIgnoresTemplate checks that Rotate never executes spec.template.data as a template.
+func TestRotateIgnoresTemplate(t *testing.T) {
+	ns := "some-namespace"
+	keyNs := "some-key-namespace"
+	var tweakopts func(*metav1.ListOptions)
+	clientset := fake.NewClientset()
+	ssc := ssfake.NewSimpleClientset()
+	keyRegistry := testKeyRegister(t, context.Background(), clientset, ns)
+
+	validFor := time.Hour
+	cn := "my-cn"
+	_, err := keyRegistry.generateKey(context.Background(), validFor, cn, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	controller, err := prepareController(clientset, ns, keyNs, tweakopts, &Flags{SkipRecreate: false}, ssc, keyRegistry)
+	if err != nil {
+		t.Fatalf("err %v want %v", err, nil)
+	}
+
+	secret := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ss",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("hunter2"),
+		},
+	}
+
+	cert, err := controller.keyRegistry.getCert()
+	if err != nil {
+		t.Fatalf("error getting certificate: %v", err)
+	}
+
+	ssecret, err := ssv1alpha1.NewSealedSecret(scheme.Codecs, cert.PublicKey.(*rsa.PublicKey), secret)
+	if err != nil {
+		t.Fatalf("error creating sealed secrets: %v", err)
+	}
+
+	// Attacker-controlled, always-failing template paired with the victim's real data.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ fail "attacker-controlled failure" }}`),
+	}
+
+	enc, err := prettyEncoder(scheme.Codecs, runtime.ContentTypeJSON, ssv1alpha1.SchemeGroupVersion)
+	if err != nil {
+		t.Fatalf("unexpected pretty encoding: %v", err)
+	}
+	data, err := runtime.Encode(enc, ssecret)
+	if err != nil {
+		t.Fatalf("unexpected encoding the sealed secret: %v", err)
+	}
+
+	if _, err := controller.Rotate(data); err != nil {
+		t.Errorf("Rotate returned error for a decryptable secret because of an unrelated template failure: %v", err)
+	}
+
+	// Different guesses against the same ciphertext must behave identically.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ if eq .password "hunter2" }}{{ fail "guessed it" }}{{ end }}`),
+	}
+	data2, err := runtime.Encode(enc, ssecret)
+	if err != nil {
+		t.Fatalf("unexpected encoding the sealed secret: %v", err)
+	}
+	if _, err := controller.Rotate(data2); err != nil {
+		t.Errorf("Rotate must not turn template execution into a decryption oracle, got error: %v", err)
+	}
+}
+
+// prepareController is called once per namespace from parallel goroutines when
+// --additional-namespaces is set, so it must be safe to call concurrently.
+// Regression test for #2045.
+func TestPrepareControllerConcurrently(t *testing.T) {
+	ns := "some-namespace"
+	keyNs := "some-key-namespace"
+	var tweakopts func(*metav1.ListOptions)
+	clientset := fake.NewClientset()
+	ssc := ssfake.NewSimpleClientset()
+	keyRegistry := testKeyRegister(t, context.Background(), clientset, ns)
+
+	const goroutines = 64
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := prepareController(clientset, ns, keyNs, tweakopts, &Flags{}, ssc, keyRegistry); err != nil {
+				errs <- err
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("prepareController failed under concurrency: %v", err)
+	}
+}
+
+// The controller's decoders (scheme.Codecs.UniversalDecoder) rely on the
+// SealedSecret types being present in the global scheme. That registration comes
+// from the v1alpha1 package init(), which is why NewController does not need to
+// repeat it. Guards that invariant.
+func TestSealedSecretTypesAreRegisteredGlobally(t *testing.T) {
+	for _, kind := range []string{"SealedSecret", "SealedSecretList"} {
+		if !scheme.Scheme.Recognizes(ssv1alpha1.SchemeGroupVersion.WithKind(kind)) {
+			t.Fatalf("%s is not registered in the global scheme", kind)
+		}
+	}
+}
+
+func TestWatchKeySecretsDynamicDetection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clientset := fake.NewClientset()
+	var nameSeq int
+	clientset.PrependReactor("create", "secrets", func(action ktesting.Action) (bool, runtime.Object, error) {
+		ca, ok := action.(ktesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		sec, ok := ca.GetObject().(*corev1.Secret)
+		if ok && sec.Name == "" && sec.GenerateName != "" {
+			nameSeq++
+			sec.Name = fmt.Sprintf("%s%d", sec.GenerateName, nameSeq)
+		}
+		return false, nil, nil
+	})
+	keyRegistry := NewKeyRegistry(clientset, "ns", "prefix", SealedSecretsKeyLabel, 2048)
+
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	kInformer, err := watchKeySecrets(informerFactory, keyRegistry, "CertNotBefore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	go kInformer.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, kInformer.HasSynced) {
+		t.Fatal("timed out waiting for informer to sync")
+	}
+
+	// 1. Generate key and write secret
+	key1, cert1, err := generatePrivateKeyAndCert(2048, time.Hour, "cn1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secName1, err := writeKey(ctx, clientset, key1, []*x509.Certificate{cert1}, "ns", SealedSecretsKeyLabel, "prefix-", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for informer to pick it up
+	var latest *rsa.PrivateKey
+	for i := 0; i < 20; i++ {
+		latest, err = keyRegistry.latestPrivateKey()
+		if err == nil && latest != nil && latest.Equal(key1) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if latest == nil || !latest.Equal(key1) {
+		t.Fatalf("expected keyRegistry to pick up newly added key secret %s", secName1)
+	}
+
+	// 2. Add second newer key via secret update/add
+	key2, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert2, err := crypto.SignKeyWithNotBefore(rand.Reader, key2, time.Now().Add(time.Minute), time.Hour, "cn2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secName2, err := writeKey(ctx, clientset, key2, []*x509.Certificate{cert2}, "ns", SealedSecretsKeyLabel, "prefix-", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
+		latest, err = keyRegistry.latestPrivateKey()
+		if err == nil && latest != nil && latest.Equal(key2) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if latest == nil || !latest.Equal(key2) {
+		t.Fatalf("expected keyRegistry to pick up updated key secret %s", secName2)
+	}
+
+	// 3. Delete key2 secret -> should unregister key2 and fallback to key1
+	err = clientset.CoreV1().Secrets("ns").Delete(ctx, secName2, metav1.DeleteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
+		latest, err = keyRegistry.latestPrivateKey()
+		if err == nil && latest != nil && latest.Equal(key1) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if latest == nil || !latest.Equal(key1) {
+		t.Fatalf("expected keyRegistry to fallback to key1 after key2 deletion, got: %v", latest)
 	}
 }

@@ -10,13 +10,13 @@ import (
 
 	flag "github.com/spf13/pflag"
 
-	"github.com/bitnami-labs/sealed-secrets/pkg/controller"
-	"github.com/bitnami-labs/sealed-secrets/pkg/flagenv"
-	"github.com/bitnami-labs/sealed-secrets/pkg/log"
-	"github.com/bitnami-labs/sealed-secrets/pkg/pflagenv"
+	"github.com/bitnami/sealed-secrets/pkg/controller"
+	"github.com/bitnami/sealed-secrets/pkg/flagenv"
+	"github.com/bitnami/sealed-secrets/pkg/log"
+	"github.com/bitnami/sealed-secrets/pkg/pflagenv"
 
-	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
-	"github.com/bitnami-labs/sealed-secrets/pkg/buildinfo"
+	ssv1alpha1 "github.com/bitnami/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
+	"github.com/bitnami/sealed-secrets/pkg/buildinfo"
 )
 
 const (
@@ -43,14 +43,15 @@ func bindControllerFlags(f *controller.Flags, fs *flag.FlagSet) {
 	fs.BoolVar(&f.NamespaceAll, "all-namespaces", true, "Scan all namespaces or only the current namespace (default=true).")
 	fs.StringVar(&f.AdditionalNamespaces, "additional-namespaces", "", "Comma-separated list of additional namespaces to be scanned.")
 	fs.StringVar(&f.LabelSelector, "label-selector", "", "Label selector which can be used to filter sealed secrets.")
-	fs.IntVar(&f.RateLimitPerSecond, "rate-limit", 2, "Number of allowed sustained request per second for verify endpoint")
-	fs.IntVar(&f.RateLimitBurst, "rate-limit-burst", 2, "Number of requests allowed to exceed the rate limit per second for verify endpoint")
+	fs.IntVar(&f.RateLimitPerSecond, "rate-limit", 2, "Number of allowed sustained requests per second for the verify and rotate endpoints")
+	fs.IntVar(&f.RateLimitBurst, "rate-limit-burst", 2, "Number of requests allowed to exceed the rate limit per second for the verify and rotate endpoints")
+	fs.BoolVar(&f.MetricsOmitSecretLabels, "metrics-omit-secret-labels", false, "When true, the sealed_secrets_controller_condition_info metric is not updated, so the metrics endpoint does not expose SealedSecret namespaces and names. Use this if :8081 is reachable by users who should not be able to enumerate SealedSecret inventory.")
 	fs.StringVar(&f.PrivateKeyAnnotations, "privatekey-annotations", "", "Comma-separated list of additional annotations to be put on renewed sealing keys.")
 	fs.StringVar(&f.PrivateKeyLabels, "privatekey-labels", "", "Comma-separated list of additional labels to be put on renewed sealing keys.")
 
 	fs.BoolVar(&f.OldGCBehavior, "old-gc-behavior", false, "Revert to old GC behavior where the controller deletes secrets instead of delegating that to k8s itself.")
 
-	fs.BoolVar(&f.UpdateStatus, "update-status", true, "beta: if true, the controller will update the status sub-resource whenever it processes a sealed secret")
+	fs.BoolVar(&f.UpdateStatus, "update-status", true, "if true, the controller will update the status sub-resource whenever it processes a sealed secret (stable; enabled by default since v0.17.0)")
 	fs.BoolVar(&f.WatchForSecrets, "watch-for-secrets", false, "beta: If this is true, the controller will watch for key secrets. This is useful if you create the key secrets externally.")
 
 	fs.BoolVar(&f.SkipRecreate, "skip-recreate", false, "if true the controller will skip listening for managed secret changes to recreate them. This helps on limited permission environments.")

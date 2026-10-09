@@ -18,7 +18,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 
-	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
+	"github.com/bitnami/sealed-secrets/pkg/crypto"
 
 	// Install standard API types.
 	_ "k8s.io/client-go/kubernetes"
@@ -353,6 +353,10 @@ func TestSealRoundTripWithMisMatchNamespaceWide(t *testing.T) {
 	}
 }
 
+func someStr(s string) *string {
+	return &s
+}
+
 func TestSealRoundTripTemplateData(t *testing.T) {
 	secret := v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -367,9 +371,9 @@ func TestSealRoundTripTemplateData(t *testing.T) {
 
 	ssecret, codecs, keys := sealSecret(t, &secret, NewSealedSecret)
 
-	ssecret.Spec.Template.Data = map[string]string{
-		"bar":           `secret {{ index . "foo" }} !`,
-		"password-json": `{{ toJson .password }}`,
+	ssecret.Spec.Template.Data = map[string]*string{
+		"bar":           someStr(`secret {{ index . "foo" }} !`),
+		"password-json": someStr(`{{ toJson .password }}`),
 	}
 
 	secret2, err := ssecret.Unseal(codecs, keys)
@@ -391,11 +395,189 @@ func TestSealRoundTripTemplateData(t *testing.T) {
 	}
 }
 
+// TestValidateEncryptedDataIgnoresTemplate ensures template execution can't affect decryptability checks.
+func TestValidateEncryptedDataIgnoresTemplate(t *testing.T) {
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+		},
+		Data: map[string][]byte{
+			"password": []byte("hunter2"),
+		},
+	}
+
+	ssecret, _, keys := sealSecret(t, &secret, NewSealedSecret)
+
+	// A failing template must not turn a decryptable secret into a validation failure.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ fail "attacker-controlled failure" }}`),
+	}
+	if err := ssecret.ValidateEncryptedData(keys); err != nil {
+		t.Errorf("ValidateEncryptedData returned error for a decryptable secret with a failing template: %v", err)
+	}
+
+	// A template with a parse error must likewise not affect the result.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ .password`),
+	}
+	if err := ssecret.ValidateEncryptedData(keys); err != nil {
+		t.Errorf("ValidateEncryptedData returned error for a decryptable secret with an unparseable template: %v", err)
+	}
+
+	// Sanity check: genuinely undecryptable data must still fail.
+	_, otherKeys := generateTestKey(t, testRand(), 2048)
+	if err := ssecret.ValidateEncryptedData(otherKeys); err == nil {
+		t.Errorf("ValidateEncryptedData did not return an error for encryptedData undecryptable with the given keys")
+	}
+}
+
+// TestUnsealWithoutTemplateIgnoresTemplate checks that UnsealWithoutTemplate never renders spec.template.data.
+func TestUnsealWithoutTemplateIgnoresTemplate(t *testing.T) {
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+		},
+		Data: map[string][]byte{
+			"password": []byte("hunter2"),
+		},
+	}
+
+	ssecret, _, keys := sealSecret(t, &secret, NewSealedSecret)
+
+	// This probe template must not affect decryption or leak into the output.
+	ssecret.Spec.Template.Data = map[string]*string{
+		"probe": someStr(`{{ if eq .password "hunter2" }}{{ fail "guessed it" }}{{ end }}`),
+	}
+
+	unsealed, err := ssecret.UnsealWithoutTemplate(serializer.CodecFactory{}, keys)
+	if err != nil {
+		t.Fatalf("UnsealWithoutTemplate returned error for a decryptable secret with a template: %v", err)
+	}
+	if got, want := string(unsealed.Data["password"]), "hunter2"; got != want {
+		t.Errorf("password: got %q, want %q", got, want)
+	}
+	if _, ok := unsealed.Data["probe"]; ok {
+		t.Errorf("UnsealWithoutTemplate must not render spec.template.data, but found rendered key %q", "probe")
+	}
+
+	// Sanity check: genuinely undecryptable data must still fail.
+	_, otherKeys := generateTestKey(t, testRand(), 2048)
+	if _, err := ssecret.UnsealWithoutTemplate(serializer.CodecFactory{}, otherKeys); err == nil {
+		t.Errorf("UnsealWithoutTemplate did not return an error for encryptedData undecryptable with the given keys")
+	}
+}
+
+// TestTemplateDataPlaintextReference verifies that plaintext keys defined
+// in spec.template.data can be referenced from sibling templates as
+// {{ .key }} variables. Regression test for
+// https://github.com/bitnami-labs/sealed-secrets/issues/1607
+func TestTemplateDataPlaintextReference(t *testing.T) {
+	sealed := SealedSecret{
+		Spec: SealedSecretSpec{
+			Template: SecretTemplateSpec{
+				Data: map[string]*string{
+					"username":     someStr("myUsername"),
+					"settings.xml": someStr(`<server><username>{{ .username }}</username></server>`),
+				},
+			},
+		},
+	}
+
+	unsealed, err := sealed.Unseal(serializer.CodecFactory{}, nil)
+	if err != nil {
+		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if got, want := string(unsealed.Data["username"]), "myUsername"; got != want {
+		t.Errorf("username: got %q, want %q", got, want)
+	}
+	if got, want := string(unsealed.Data["settings.xml"]),
+		`<server><username>myUsername</username></server>`; got != want {
+		t.Errorf("settings.xml: got %q, want %q", got, want)
+	}
+}
+
+// TestTemplateDataMixedEncryptedAndPlaintext verifies that templates in
+// spec.template.data can reference both encryptedData keys and sibling
+// plaintext keys defined in spec.template.data in the same template.
+// Regression test for
+// https://github.com/bitnami-labs/sealed-secrets/issues/1607
+func TestTemplateDataMixedEncryptedAndPlaintext(t *testing.T) {
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+		},
+		Data: map[string][]byte{
+			"password": []byte("hunter2"),
+		},
+	}
+
+	ssecret, codecs, keys := sealSecret(t, &secret, NewSealedSecret)
+
+	ssecret.Spec.Template.Data = map[string]*string{
+		"username": someStr("myUsername"),
+		"settings.xml": someStr(`<server>` +
+			`<username>{{ .username }}</username>` +
+			`<password>{{ .password }}</password>` +
+			`</server>`),
+	}
+
+	unsealed, err := ssecret.Unseal(codecs, keys)
+	if err != nil {
+		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if got, want := string(unsealed.Data["settings.xml"]),
+		`<server><username>myUsername</username><password>hunter2</password></server>`; got != want {
+		t.Errorf("settings.xml: got %q, want %q", got, want)
+	}
+}
+
+// TestTemplateDataEncryptedTakesPrecedenceOverPlaintext verifies that when
+// the same key exists in both encryptedData and template.data, the
+// decrypted value from encryptedData wins. This guards against accidentally
+// shadowing a real secret with a plaintext placeholder.
+func TestTemplateDataEncryptedTakesPrecedenceOverPlaintext(t *testing.T) {
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+		},
+		Data: map[string][]byte{
+			"shared": []byte("from-encrypted"),
+		},
+	}
+
+	ssecret, codecs, keys := sealSecret(t, &secret, NewSealedSecret)
+
+	ssecret.Spec.Template.Data = map[string]*string{
+		"shared":  someStr("from-plaintext-should-be-ignored"),
+		"out.txt": someStr(`{{ .shared }}`),
+	}
+
+	unsealed, err := ssecret.Unseal(codecs, keys)
+	if err != nil {
+		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if got, want := string(unsealed.Data["out.txt"]), "from-encrypted"; got != want {
+		t.Errorf("out.txt: got %q, want %q", got, want)
+	}
+	// The output Secret's "shared" key must retain the decrypted value,
+	// not be overwritten by the plaintext template.data entry.
+	if got, want := string(unsealed.Data["shared"]), "from-encrypted"; got != want {
+		t.Errorf("shared key in output Secret: got %q, want %q (plaintext template.data must not overwrite encrypted value)", got, want)
+	}
+}
+
 func TestTemplateWithoutEncryptedData(t *testing.T) {
 	sealed := SealedSecret{
 		Spec: SealedSecretSpec{
 			Template: SecretTemplateSpec{
-				Data: map[string]string{"foo": "bar"},
+				Data: map[string]*string{"foo": someStr("bar")},
 			},
 		},
 	}
@@ -410,6 +592,41 @@ func TestTemplateWithoutEncryptedData(t *testing.T) {
 	}
 }
 
+func TestTemplateOmitEncryptedData(t *testing.T) {
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+		},
+		Data: map[string][]byte{
+			"foo": []byte("bar"),
+			"baz": []byte("qux"),
+		},
+	}
+
+	ssecret, codecs, keys := sealSecret(t, &secret, NewSealedSecret)
+
+	sealed := SealedSecret{
+		ObjectMeta: secret.ObjectMeta,
+		Spec: SealedSecretSpec{
+			EncryptedData: ssecret.Spec.EncryptedData,
+			Template: SecretTemplateSpec{
+				ObjectMeta: secret.ObjectMeta,
+				Data:       map[string]*string{"foo": nil, "bar": someStr("qux {{ .foo }} qux")},
+			},
+		},
+	}
+
+	unsealed, err := sealed.Unseal(codecs, keys)
+	if err != nil {
+		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if got, want := unsealed.Data, map[string][]byte{"bar": []byte("qux bar qux"), "baz": []byte("qux")}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got: %q, want: %q (input: %q)", got, want, ssecret.Spec.EncryptedData)
+	}
+}
+
 func TestSkipSetOwnerReference(t *testing.T) {
 	testCases := []struct {
 		sealedSecret          SealedSecret
@@ -420,7 +637,7 @@ func TestSkipSetOwnerReference(t *testing.T) {
 			sealedSecret: SealedSecret{
 				Spec: SealedSecretSpec{
 					Template: SecretTemplateSpec{
-						Data: map[string]string{"foo": "bar"},
+						Data: map[string]*string{"foo": someStr("bar")},
 					},
 				},
 			},
@@ -433,7 +650,7 @@ func TestSkipSetOwnerReference(t *testing.T) {
 			sealedSecret: SealedSecret{
 				Spec: SealedSecretSpec{
 					Template: SecretTemplateSpec{
-						Data: map[string]string{"foo": "bar"},
+						Data: map[string]*string{"foo": someStr("bar")},
 					},
 				},
 			},

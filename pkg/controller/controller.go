@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,12 +28,12 @@ import (
 
 	"k8s.io/client-go/informers"
 
-	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
-	ssclientset "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned"
-	ssscheme "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/scheme"
-	ssv1alpha1client "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/typed/sealedsecrets/v1alpha1"
-	ssinformer "github.com/bitnami-labs/sealed-secrets/pkg/client/informers/externalversions"
-	"github.com/bitnami-labs/sealed-secrets/pkg/multidocyaml"
+	ssv1alpha1 "github.com/bitnami/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
+	ssclientset "github.com/bitnami/sealed-secrets/pkg/client/clientset/versioned"
+	ssv1alpha1client "github.com/bitnami/sealed-secrets/pkg/client/clientset/versioned/typed/sealedsecrets/v1alpha1"
+	ssinformer "github.com/bitnami/sealed-secrets/pkg/client/informers/externalversions"
+	"github.com/bitnami/sealed-secrets/pkg/crypto"
+	"github.com/bitnami/sealed-secrets/pkg/multidocyaml"
 )
 
 const (
@@ -90,7 +89,6 @@ func NewController(
 ) (*Controller, error) {
 	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
-	utilruntime.Must(ssscheme.AddToScheme(scheme.Scheme))
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(func(format string, args ...interface{}) {
 		// Must use Sprintf to ensure slog doesn't interpret args... as key-value pairs
@@ -138,11 +136,49 @@ func watchKeySecrets(kinformer informers.SharedInformerFactory, registry *KeyReg
 	kInformer := kinformer.Core().V1().Secrets().Informer()
 	_, err := kInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			err := registryNewKeyWithSecret(obj.(*corev1.Secret), registry, keyOrderPriority)
-			if err != nil {
-				slog.Error("failed to register key", "error", err)
+			secret, ok := obj.(*corev1.Secret)
+			if !ok {
 				return
 			}
+			err := registryNewKeyWithSecret(secret, registry, keyOrderPriority)
+			if err != nil {
+				slog.Error("failed to register key", "secret", secret.Name, "error", err)
+				return
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			secret, ok := newObj.(*corev1.Secret)
+			if !ok {
+				return
+			}
+			err := registryNewKeyWithSecret(secret, registry, keyOrderPriority)
+			if err != nil {
+				slog.Error("failed to register updated key", "secret", secret.Name, "error", err)
+				return
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			secret, ok := obj.(*corev1.Secret)
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					return
+				}
+				secret, ok = tombstone.Obj.(*corev1.Secret)
+				if !ok {
+					return
+				}
+			}
+			key, _, err := readKey(secret)
+			if err != nil {
+				return
+			}
+			fp, err := crypto.PublicKeyFingerprint(&key.PublicKey)
+			if err != nil {
+				return
+			}
+			registry.unregisterKey(fp)
+			slog.Info("unregistered deleted private key", "secretname", secret.Name)
 		},
 	})
 	if err != nil {
@@ -244,13 +280,16 @@ func watchSecrets(sinformer informers.SharedInformerFactory, ssclientset ssclien
 // HasSynced returns true once this controller has completed an
 // initial resource listing.
 func (c *Controller) HasSynced() bool {
-	var synced bool
-	if c.sInformer == nil {
-		synced = c.ssInformer.HasSynced()
-	} else {
-		synced = c.ssInformer.HasSynced() && c.sInformer.HasSynced()
+	if !c.ssInformer.HasSynced() {
+		return false
 	}
-	return synced
+	if c.sInformer != nil && !c.sInformer.HasSynced() {
+		return false
+	}
+	if c.kInformer != nil && !c.kInformer.HasSynced() {
+		return false
+	}
+	return true
 }
 
 // LastSyncResourceVersion is the resource version observed when last
@@ -535,7 +574,7 @@ func formatImmutableError(key string) string {
 	return fmt.Sprintf("Error updating %s: the target Secret is immutable. Once a Secret is marked as immutable, it is not possible to revert this change nor to mutate the contents of the data field. You can only delete and recreate the Secret.", key)
 }
 
-// AttemptUnseal tries to unseal a secret.
+// AttemptUnseal checks whether a secret is decryptable, without rendering spec.template.data.
 func (c *Controller) AttemptUnseal(content []byte) (bool, error) {
 	if err := multidocyaml.EnsureNotMultiDoc(content); err != nil {
 		return false, err
@@ -548,7 +587,7 @@ func (c *Controller) AttemptUnseal(content []byte) (bool, error) {
 
 	switch s := object.(type) {
 	case *ssv1alpha1.SealedSecret:
-		if _, err := c.attemptUnseal(s); err != nil {
+		if err := s.ValidateEncryptedData(c.keyRegistry.privateKeys()); err != nil {
 			return false, nil
 		}
 		return true, nil
@@ -575,11 +614,14 @@ func (c *Controller) Rotate(content []byte) ([]byte, error) {
 			slog.Warn("Sealed Secret metadata doesn't match. Please align your Sealed Secret metadata")
 		}
 
-		secret, err := c.attemptUnseal(s)
+		secret, err := c.attemptUnsealForRotate(s)
 		if err != nil {
 			return nil, fmt.Errorf("error decrypting secret. %v", err)
 		}
-		latestPrivKey := c.keyRegistry.latestPrivateKey()
+		latestPrivKey, err := c.keyRegistry.latestPrivateKey()
+		if err != nil {
+			return nil, fmt.Errorf("error getting latest private key. %v", err)
+		}
 		resealedSecret, err := ssv1alpha1.NewSealedSecret(scheme.Codecs, &latestPrivKey.PublicKey, secret)
 		if err != nil {
 			return nil, fmt.Errorf("error creating new sealed secret. %v", err)
@@ -599,9 +641,10 @@ func (c *Controller) attemptUnseal(ss *ssv1alpha1.SealedSecret) (*corev1.Secret,
 }
 
 func attemptUnseal(ss *ssv1alpha1.SealedSecret, keyRegistry *KeyRegistry) (*corev1.Secret, error) {
-	privateKeys := map[string]*rsa.PrivateKey{}
-	for k, v := range keyRegistry.keys {
-		privateKeys[k] = v.private
-	}
-	return ss.Unseal(scheme.Codecs, privateKeys)
+	return ss.Unseal(scheme.Codecs, keyRegistry.privateKeys())
+}
+
+// attemptUnsealForRotate decrypts without rendering the template, since /v1/rotate is unauthenticated and the template could be used as a decryption oracle.
+func (c *Controller) attemptUnsealForRotate(ss *ssv1alpha1.SealedSecret) (*corev1.Secret, error) {
+	return ss.UnsealWithoutTemplate(scheme.Codecs, c.keyRegistry.privateKeys())
 }

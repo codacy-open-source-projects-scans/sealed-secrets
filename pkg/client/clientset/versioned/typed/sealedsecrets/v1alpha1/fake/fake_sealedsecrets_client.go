@@ -3,7 +3,7 @@
 package fake
 
 import (
-	v1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/typed/sealedsecrets/v1alpha1"
+	v1alpha1 "github.com/bitnami/sealed-secrets/pkg/client/clientset/versioned/typed/sealedsecrets/v1alpha1"
 	rest "k8s.io/client-go/rest"
 	testing "k8s.io/client-go/testing"
 )
@@ -13,7 +13,7 @@ type FakeBitnamiV1alpha1 struct {
 }
 
 func (c *FakeBitnamiV1alpha1) SealedSecrets(namespace string) v1alpha1.SealedSecretInterface {
-	return &FakeSealedSecrets{c, namespace}
+	return newFakeSealedSecrets(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate
